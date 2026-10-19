@@ -42,6 +42,7 @@ from zappa.letsencrypt import (
     create_domain_csr,
     create_domain_key,
     encode_certificate,
+    get_boulder_header,
     get_cert_and_update_domain,
     gettempdir,
     parse_account_key,
@@ -4408,6 +4409,54 @@ class TestZappa(unittest.TestCase):
     ##
     # Let's Encrypt / ACME
     ##
+
+    # Two renderings of the same 2048-bit modulus. OpenSSL < 4 prints the DER
+    # sign byte ("00:") that keeps the ASN.1 INTEGER positive; OpenSSL 4 does
+    # not. Both must yield the same JWK, since that byte is not part of the
+    # modulus. Built from one hex string so they cannot drift apart.
+    # 2 + 508 + 2 = 512 hex chars = 256 bytes = 2048 bits, leading byte 0xb8
+    # so the high bit is set (which is what makes the sign byte apply at all).
+    _MODULUS_HEX = "b8" + "a1" * 254 + "cd"
+
+    @classmethod
+    def _openssl_text(cls, with_sign_byte):
+        octets = [cls._MODULUS_HEX[i : i + 2] for i in range(0, len(cls._MODULUS_HEX), 2)]
+        if with_sign_byte:
+            octets.insert(0, "00")
+        lines = ["    " + ":".join(octets[i : i + 15]) + ":" for i in range(0, len(octets), 15)]
+        lines[-1] = lines[-1].rstrip(":")
+        return (
+            "Private-Key: (2048 bit, 2 primes)\nmodulus:\n" + "\n".join(lines) + "\npublicExponent: 65537 (0x10001)\n"
+        ).encode()
+
+    def test_get_boulder_header_without_der_sign_byte(self):
+        """
+        OpenSSL 4 omits the leading "00:" from the modulus dump. Parsing must
+        not depend on it being there - it used to, which broke
+        test_lets_encrypt_sanity on any machine with OpenSSL 4.
+        """
+        header = get_boulder_header(self._openssl_text(with_sign_byte=False))
+        self.assertEqual("RS256", header["alg"])
+        self.assertEqual("RSA", header["jwk"]["kty"])
+
+    def test_get_boulder_header_ignores_der_sign_byte(self):
+        """
+        The "00:" is an ASN.1 artifact, not part of the modulus, so both
+        OpenSSL renderings must produce an identical JWK.
+        """
+        without = get_boulder_header(self._openssl_text(with_sign_byte=False))
+        with_byte = get_boulder_header(self._openssl_text(with_sign_byte=True))
+        self.assertEqual(without["jwk"]["n"], with_byte["jwk"]["n"])
+        self.assertEqual(without["jwk"]["e"], with_byte["jwk"]["e"])
+
+    def test_get_boulder_header_modulus_round_trips(self):
+        """The decoded modulus is the exact 256 bytes, with no sign byte."""
+        import base64
+
+        header = get_boulder_header(self._openssl_text(with_sign_byte=True))
+        raw = base64.urlsafe_b64decode(header["jwk"]["n"] + "=" * (-len(header["jwk"]["n"]) % 4))
+        self.assertEqual(256, len(raw))
+        self.assertEqual(self._MODULUS_HEX, raw.hex())
 
     def test_lets_encrypt_sanity(self):
         # We need a fake account key and crt
